@@ -55,6 +55,8 @@ from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
+    assert_valid_sqlite_header,
+    write_lock_for,
 )
 from .tokens import count_message_tokens
 
@@ -351,10 +353,13 @@ class MessageStore:
         # aliasing could intersect SQLite's flush of a write. It does not
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
+        self._write_lock = write_lock_for(self.db_path)
         self._init_db()
 
     def _init_db(self):
+        # Fail loud on a stomped page 1 (see W62): opening it in place degrades
+        # the context engine to the lossy compressor with only a log warning.
+        assert_valid_sqlite_header(self.db_path)
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)

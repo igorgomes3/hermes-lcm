@@ -19,6 +19,8 @@ import time
 from contextlib import contextmanager
 from typing import Iterable, Sequence
 
+from .sqlite_util import write_lock_for
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,7 +134,15 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    # mmap_size is opt-in (W62): with several write connections per process plus
+    # CLI/sub-agent processes on the same file, a memory map of the database can
+    # keep serving a page image that is no longer on disk — the failure mode that
+    # puts a foreign page at offset 0. Default off; set LCM_MMAP_SIZE to restore.
+    try:
+        _mmap_bytes = int(os.environ.get("LCM_MMAP_SIZE", "0") or 0)
+    except ValueError:
+        _mmap_bytes = 0
+    conn.execute(f"PRAGMA mmap_size={max(0, _mmap_bytes)}")
 
 
 def _execute_wal_conversion_with_lock_retry(
@@ -2670,8 +2680,9 @@ def _run_background_integrity_scan(
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
+            with write_lock_for(db_path):
+                _record_scan_started(scan_conn, spec, now=started_at)
+                scan_conn.commit()
             result = check_external_content_fts_integrity(scan_conn, spec)
         finally:
             scan_conn.close()
@@ -2680,23 +2691,26 @@ def _run_background_integrity_scan(
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
-                logger.warning(
-                    "Background FTS integrity-check found corruption in '%s': %s. "
-                    "Run `/lcm doctor repair apply` to rebuild the index.",
-                    spec.table_name,
-                    result.get("detail", ""),
-                )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
+            # One writer per file (W62): the scan's stamp shares the queue with
+            # the store's own writes instead of racing its checkpoint.
+            with write_lock_for(db_path):
+                if status == "pass":
+                    _record_integrity_checked(meta_conn, spec, now=started_at)
+                    _clear_integrity_failed(meta_conn, spec)
+                elif status == "fail":
+                    _record_integrity_failed(
+                        meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    )
+                    logger.warning(
+                        "Background FTS integrity-check found corruption in '%s': %s. "
+                        "Run `/lcm doctor repair apply` to rebuild the index.",
+                        spec.table_name,
+                        result.get("detail", ""),
+                    )
+                # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                # so the next bind retries; do not stamp or flag.
+                _clear_scan_started(meta_conn, spec, expected=started_at)
+                meta_conn.commit()
         finally:
             meta_conn.close()
     except Exception:  # pragma: no cover - defensive
@@ -2757,9 +2771,10 @@ def _dispatch_background_integrity_scan(
             )
             try:
                 claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
+                with write_lock_for(db_path):
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
             finally:
                 claim_conn.close()
         except sqlite3.DatabaseError:

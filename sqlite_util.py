@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
@@ -237,3 +238,69 @@ def _temporary_sqlite_busy_timeout(
     finally:
         for conn, original in reversed(originals):
             conn.execute(f"PRAGMA busy_timeout={original}")
+
+
+SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+_HEADER_PROBE_BYTES = 100
+
+_WRITE_LOCKS: "dict[str, threading.RLock]" = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def write_lock_for(path: str | Path) -> threading.RLock:
+    """Process-wide re-entrant lock for every writer of one database file.
+
+    The store, the DAG, the lifecycle table and the FTS integrity-check each
+    hold their own connection to the same file. SQLite serializes at the file
+    lock level but the Python side has no ordering between them, so a write
+    transaction on one connection can interleave with a checkpoint issued by
+    another. Keying the lock on the resolved path gives all of them one queue.
+    """
+    key = str(Path(path).resolve())
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _WRITE_LOCKS[key] = lock
+        return lock
+
+
+class LcmHeaderCorruptionError(sqlite3.DatabaseError):
+    """Page 1 of the database file is not a SQLite header.
+
+    Distinct from a generic ``DatabaseError`` so callers can quarantine and
+    surface the file instead of degrading silently: a stomped page 1 means some
+    write landed at offset 0, and every connection opened afterwards reads
+    garbage while the WAL still looks healthy.
+    """
+
+
+def assert_valid_sqlite_header(path: str | Path) -> None:
+    """Refuse to open a database whose page-1 header was destroyed.
+
+    Reads only the first 100 bytes. A missing or zero-length file is fine —
+    SQLite initialises both — but anything that has bytes without the SQLite
+    magic (or with an impossible page size) is a corruption we must not hide.
+    """
+    db_path = Path(path)
+    try:
+        with open(db_path, "rb") as handle:
+            head = handle.read(_HEADER_PROBE_BYTES)
+    except FileNotFoundError:
+        return
+    if not head:  # zero-length: a fresh database SQLite will initialise
+        return
+    if not head.startswith(SQLITE_HEADER_MAGIC):
+        raise LcmHeaderCorruptionError(
+            f"{db_path.name}: page 1 is not a SQLite header "
+            f"(first 16 bytes: {head[:16].hex()}). A page-sized write landed on "
+            "offset 0; quarantine this file and restore a backup instead of "
+            "opening it in place."
+        )
+    page_size = int.from_bytes(head[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise LcmHeaderCorruptionError(
+            f"{db_path.name}: header declares an impossible page size "
+            f"({page_size}); the file is corrupted."
+        )
